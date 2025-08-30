@@ -10,6 +10,9 @@ A modern FastAPI application with PostgreSQL database and Redis caching, contain
 - **Docker** - Containerized for easy deployment
 - **SQLAlchemy** - Python ORM for database operations
 - **Pydantic** - Data validation using Python type annotations
+- **Celery** - Distributed task queue for background processing
+- **NewsAPI Integration** - Fetch and process news articles
+- **pgAdmin** - Web-based PostgreSQL administration
 
 ## Project Structure
 
@@ -60,13 +63,25 @@ fastapi-app/
 
 ## API Endpoints
 
+### General
 - `GET /` - Welcome message
 - `GET /health` - Health check
+
+### Users
 - `POST /api/v1/users/` - Create a new user
 - `GET /api/v1/users/` - Get all users
 - `GET /api/v1/users/{user_id}` - Get user by ID
 - `PUT /api/v1/users/{user_id}` - Update user
 - `DELETE /api/v1/users/{user_id}` - Delete user
+
+### News Articles
+- `POST /api/v1/news/fetch` - Fetch articles from NewsAPI
+- `GET /api/v1/articles` - Get articles (with filtering)
+- `GET /api/v1/articles/{article_id}` - Get specific article
+- `PUT /api/v1/articles/{article_id}` - Update article status/category
+- `POST /api/v1/articles/{article_id}/reprocess` - Reprocess article
+- `GET /api/v1/tasks/{task_id}` - Get Celery task status
+- `GET /api/v1/articles/stats/summary` - Get article statistics
 
 ## Environment Variables
 
@@ -92,6 +107,8 @@ docker-compose up --build
 - **PostgreSQL**: Runs on port 5432
 - **Redis**: Runs on port 6379
 - **pgAdmin**: Runs on port 5050 (Database administration interface)
+- **Celery Worker**: Background task processing
+- **Flower**: Runs on port 5555 (Celery monitoring interface)
 
 ## Example Usage
 
@@ -109,6 +126,44 @@ curl -X POST "http://localhost:8000/api/v1/users/" \
 Get all users:
 ```bash
 curl "http://localhost:8000/api/v1/users/"
+```
+
+### News API Examples
+
+Fetch news articles about technology:
+```bash
+curl -X POST "http://localhost:8000/api/v1/news/fetch" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "query": "technology",
+       "language": "en",
+       "page_size": 10
+     }'
+```
+
+Get all articles:
+```bash
+curl "http://localhost:8000/api/v1/articles"
+```
+
+Get approved articles only:
+```bash
+curl "http://localhost:8000/api/v1/articles?status=approved"
+```
+
+Get technology articles:
+```bash
+curl "http://localhost:8000/api/v1/articles?category=technology"
+```
+
+Check task status:
+```bash
+curl "http://localhost:8000/api/v1/tasks/{task_id}"
+```
+
+Get article statistics:
+```bash
+curl "http://localhost:8000/api/v1/articles/stats/summary"
 ```
 
 ## pgAdmin Setup

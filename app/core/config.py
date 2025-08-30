@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     debug: bool = True
     app_port: int = 8000
     
+    # NewsAPI settings
+    news_api_url: str = "https://newsapi.org/v2/everything"
+    news_api_key: str = "ff08eb11e86d41619ae0c0a19266adb4"
+    
+    # Celery settings
+    celery_broker_url: str = "redis://redis:6379/0"
+    celery_result_backend: str = "redis://redis:6379/0"
+    
     class Config:
         env_file = ".env"
 
