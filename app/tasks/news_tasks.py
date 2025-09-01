@@ -2,6 +2,7 @@ from celery import current_task
 from app.core.celery_app import celery_app
 from app.db.database import SessionLocal
 from app.models.article import Article, ArticleStatus, ArticleCategory
+from app.services.cache_service import cache_service
 from datetime import datetime
 import logging
 import re
@@ -72,6 +73,27 @@ def process_article_approval(self, article_id: int):
         
         article.processed_at = datetime.utcnow()
         db.commit()
+        db.refresh(article)
+        
+        # Cache the updated article
+        cache_service.cache_article(article)
+        
+        # If article was approved, update caches
+        if article.status == ArticleStatus.APPROVED:
+            # Invalidate article lists to include new approved article
+            cache_service.invalidate_articles_lists()
+            
+            # Cache article in category if it has one
+            if article.category:
+                # Get other approved articles in this category to update cache
+                category_articles = db.query(Article).filter(
+                    Article.category == article.category,
+                    Article.status == ArticleStatus.APPROVED
+                ).all()
+                cache_service.cache_category_articles(article.category.value, category_articles)
+        else:
+            # If rejected, just invalidate the relevant caches
+            cache_service.invalidate_articles_lists()
         
         current_task.update_state(state="PROGRESS", meta={"progress": 100})
         
@@ -140,6 +162,22 @@ def categorize_article(self, article_id: int):
             article.category = ArticleCategory.GENERAL
         
         db.commit()
+        db.refresh(article)
+        
+        # Cache the updated article
+        cache_service.cache_article(article)
+        
+        # If article is approved, update category cache
+        if article.status == ArticleStatus.APPROVED:
+            # Get all approved articles in this category
+            category_articles = db.query(Article).filter(
+                Article.category == article.category,
+                Article.status == ArticleStatus.APPROVED
+            ).all()
+            cache_service.cache_category_articles(article.category.value, category_articles)
+            
+            # Invalidate general article lists to reflect category change
+            cache_service.invalidate_articles_lists()
         
         current_task.update_state(state="PROGRESS", meta={"progress": 100})
         
@@ -154,6 +192,71 @@ def categorize_article(self, article_id: int):
         
     except Exception as e:
         logger.error(f"Error categorizing article {article_id}: {str(e)}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(bind=True)
+def warm_cache_task(self):
+    """
+    Background task to warm up the cache with approved articles
+    """
+    db = SessionLocal()
+    try:
+        current_task.update_state(state="PROGRESS", meta={"progress": 10})
+        
+        # Get all approved articles
+        approved_articles = db.query(Article).filter(
+            Article.status == ArticleStatus.APPROVED
+        ).order_by(Article.created_at.desc()).limit(500).all()
+        
+        current_task.update_state(state="PROGRESS", meta={"progress": 30})
+        
+        # Warm cache with articles
+        cache_service.warm_cache(approved_articles)
+        
+        current_task.update_state(state="PROGRESS", meta={"progress": 70})
+        
+        # Cache statistics
+        total_articles = db.query(Article).count()
+        pending_articles = db.query(Article).filter(Article.status == ArticleStatus.PENDING).count()
+        approved_count = len(approved_articles)
+        rejected_articles = db.query(Article).filter(Article.status == ArticleStatus.REJECTED).count()
+        
+        # Category distribution
+        category_stats = {}
+        for category in ArticleCategory:
+            count = db.query(Article).filter(
+                Article.category == category,
+                Article.status == ArticleStatus.APPROVED
+            ).count()
+            category_stats[category.value] = count
+        
+        stats = {
+            "total_articles": total_articles,
+            "status_distribution": {
+                "pending": pending_articles,
+                "approved": approved_count,
+                "rejected": rejected_articles
+            },
+            "category_distribution": category_stats
+        }
+        
+        cache_service.cache_stats(stats)
+        
+        current_task.update_state(state="PROGRESS", meta={"progress": 100})
+        
+        logger.info(f"Cache warmed with {approved_count} articles")
+        
+        return {
+            "status": "completed",
+            "cached_articles": approved_count,
+            "total_articles": total_articles
+        }
+        
+    except Exception as e:
+        logger.error(f"Error warming cache: {str(e)}")
         return {"status": "error", "message": str(e)}
     finally:
         db.close()
@@ -190,6 +293,10 @@ def process_fetched_articles(self, articles_data: list):
             # Trigger approval and categorization tasks
             process_article_approval.delay(article.id)
             categorize_article.delay(article.id)
+        
+        # Invalidate cached article lists since new articles were added
+        if saved_articles:
+            cache_service.invalidate_articles_lists()
         
         return {
             "status": "completed",

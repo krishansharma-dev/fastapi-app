@@ -12,7 +12,8 @@ from app.models.schemas import (
     ArticleCategoryEnum
 )
 from app.services.news_service import news_service
-from app.tasks.news_tasks import process_fetched_articles, process_article_approval, categorize_article
+from app.services.cache_service import cache_service
+from app.tasks.news_tasks import process_fetched_articles, process_article_approval, categorize_article, warm_cache_task
 from app.core.celery_app import celery_app
 
 router = APIRouter()
@@ -68,11 +69,27 @@ def get_articles(
     limit: int = 20,
     status: Optional[ArticleStatusEnum] = None,
     category: Optional[ArticleCategoryEnum] = None,
+    use_cache: bool = True,
     db: Session = Depends(get_db)
 ):
     """
     Get articles with optional filtering by status and category
+    Uses Redis cache for improved performance
     """
+    # Try to get from cache first
+    if use_cache:
+        status_str = status.value if status else None
+        category_str = category.value if category else None
+        cached_articles = cache_service.get_cached_articles_list(
+            status=status_str, 
+            category=category_str, 
+            skip=skip, 
+            limit=limit
+        )
+        if cached_articles:
+            return cached_articles
+    
+    # If not in cache, query database
     query = db.query(Article)
     
     if status:
@@ -82,17 +99,42 @@ def get_articles(
         query = query.filter(Article.category == ArticleCategory(category.value))
     
     articles = query.offset(skip).limit(limit).all()
+    
+    # Cache the results for future requests
+    if use_cache and articles:
+        status_str = status.value if status else None
+        category_str = category.value if category else None
+        cache_service.cache_articles_list(
+            articles, 
+            status=status_str, 
+            category=category_str, 
+            skip=skip, 
+            limit=limit
+        )
+    
     return articles
 
 
 @router.get("/articles/{article_id}", response_model=ArticleSchema)
-def get_article(article_id: int, db: Session = Depends(get_db)):
+def get_article(article_id: int, use_cache: bool = True, db: Session = Depends(get_db)):
     """
-    Get a specific article by ID
+    Get a specific article by ID with caching support
     """
+    # Try cache first
+    if use_cache:
+        cached_article = cache_service.get_cached_article(article_id)
+        if cached_article:
+            return cached_article
+    
+    # Query database if not in cache
     article = db.query(Article).filter(Article.id == article_id).first()
     if not article:
         raise HTTPException(status_code=404, detail="Article not found")
+    
+    # Cache the article for future requests
+    if use_cache:
+        cache_service.cache_article(article)
+    
     return article
 
 
@@ -121,6 +163,21 @@ def update_article(
     
     db.commit()
     db.refresh(article)
+    
+    # Update cache with the modified article
+    cache_service.cache_article(article)
+    
+    # Invalidate article lists to reflect changes
+    cache_service.invalidate_articles_lists()
+    
+    # If category was updated and article is approved, update category cache
+    if "category" in update_data and article.status == ArticleStatus.APPROVED:
+        category_articles = db.query(Article).filter(
+            Article.category == article.category,
+            Article.status == ArticleStatus.APPROVED
+        ).all()
+        cache_service.cache_category_articles(article.category.value, category_articles)
+    
     return article
 
 
@@ -183,22 +240,32 @@ def get_task_status(task_id: str):
 
 
 @router.get("/articles/stats/summary")
-def get_articles_summary(db: Session = Depends(get_db)):
+def get_articles_summary(use_cache: bool = True, db: Session = Depends(get_db)):
     """
-    Get summary statistics of articles
+    Get summary statistics of articles with caching support
     """
+    # Try cache first
+    if use_cache:
+        cached_stats = cache_service.get_cached_stats()
+        if cached_stats:
+            return cached_stats
+    
+    # Calculate stats from database
     total_articles = db.query(Article).count()
     pending_articles = db.query(Article).filter(Article.status == ArticleStatus.PENDING).count()
     approved_articles = db.query(Article).filter(Article.status == ArticleStatus.APPROVED).count()
     rejected_articles = db.query(Article).filter(Article.status == ArticleStatus.REJECTED).count()
     
-    # Category distribution
+    # Category distribution (only approved articles)
     category_stats = {}
     for category in ArticleCategory:
-        count = db.query(Article).filter(Article.category == category).count()
+        count = db.query(Article).filter(
+            Article.category == category,
+            Article.status == ArticleStatus.APPROVED
+        ).count()
         category_stats[category.value] = count
     
-    return {
+    stats = {
         "total_articles": total_articles,
         "status_distribution": {
             "pending": pending_articles,
@@ -207,3 +274,158 @@ def get_articles_summary(db: Session = Depends(get_db)):
         },
         "category_distribution": category_stats
     }
+    
+    # Cache the stats
+    if use_cache:
+        cache_service.cache_stats(stats)
+    
+    return stats
+
+
+# Cache Management Endpoints
+@router.post("/cache/warm", response_model=TaskResponse)
+def warm_cache(db: Session = Depends(get_db)):
+    """
+    Trigger cache warming as a background task
+    """
+    task = warm_cache_task.delay()
+    
+    return TaskResponse(
+        task_id=task.id,
+        status="processing",
+        message="Started cache warming process"
+    )
+
+
+@router.delete("/cache/invalidate")
+def invalidate_cache():
+    """
+    Invalidate all cached articles and lists
+    """
+    try:
+        # Invalidate article lists and stats
+        cache_service.invalidate_articles_lists()
+        
+        # Invalidate individual articles
+        article_keys = cache_service.redis_client.keys("article:*")
+        if article_keys:
+            cache_service.redis_client.delete(*article_keys)
+        
+        # Invalidate NewsAPI cache
+        newsapi_keys = cache_service.redis_client.keys("newsapi:*")
+        if newsapi_keys:
+            cache_service.redis_client.delete(*newsapi_keys)
+        
+        return {
+            "message": "All caches invalidated successfully",
+            "invalidated_keys": len(article_keys) + len(newsapi_keys)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to invalidate cache: {str(e)}")
+
+
+@router.delete("/cache/articles/{article_id}")
+def invalidate_article_cache(article_id: int):
+    """
+    Invalidate cache for a specific article
+    """
+    try:
+        success = cache_service.invalidate_article(article_id)
+        if success:
+            return {"message": f"Cache invalidated for article {article_id}"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to invalidate article cache")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/cache/category/{category}")
+def invalidate_category_cache(category: str):
+    """
+    Invalidate cache for a specific category
+    """
+    try:
+        # Validate category
+        valid_categories = [cat.value for cat in ArticleCategory]
+        if category not in valid_categories:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid category. Must be one of: {valid_categories}"
+            )
+        
+        success = cache_service.invalidate_category_cache(category)
+        if success:
+            return {"message": f"Cache invalidated for category: {category}"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to invalidate category cache")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/cache/info")
+def get_cache_info():
+    """
+    Get information about the current cache state
+    """
+    try:
+        cache_info = cache_service.get_cache_info()
+        return cache_info
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/articles/approved", response_model=List[ArticleSchema])
+def get_approved_articles(use_cache: bool = True, db: Session = Depends(get_db)):
+    """
+    Get approved articles with caching (optimized endpoint for public use)
+    """
+    # Try cache first
+    if use_cache:
+        cached_articles = cache_service.get_cached_approved_articles()
+        if cached_articles:
+            return cached_articles
+    
+    # Query database if not in cache
+    articles = db.query(Article).filter(
+        Article.status == ArticleStatus.APPROVED
+    ).order_by(Article.created_at.desc()).limit(50).all()
+    
+    # Cache the results
+    if use_cache:
+        cache_service.cache_approved_articles(articles)
+    
+    return articles
+
+
+@router.get("/articles/category/{category}", response_model=List[ArticleSchema])
+def get_articles_by_category(category: str, use_cache: bool = True, db: Session = Depends(get_db)):
+    """
+    Get approved articles by category with caching
+    """
+    # Validate category
+    valid_categories = [cat.value for cat in ArticleCategory]
+    if category not in valid_categories:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid category. Must be one of: {valid_categories}"
+        )
+    
+    # Try cache first
+    if use_cache:
+        cached_articles = cache_service.get_cached_category_articles(category)
+        if cached_articles:
+            return cached_articles
+    
+    # Query database if not in cache
+    articles = db.query(Article).filter(
+        Article.category == ArticleCategory(category),
+        Article.status == ArticleStatus.APPROVED
+    ).order_by(Article.created_at.desc()).limit(50).all()
+    
+    # Cache the results
+    if use_cache:
+        cache_service.cache_category_articles(category, articles)
+    
+    return articles

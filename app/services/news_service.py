@@ -1,8 +1,11 @@
 import httpx
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from app.core.config import settings
+from app.services.cache_service import cache_service
 import logging
+import hashlib
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -11,6 +14,14 @@ class NewsAPIService:
     def __init__(self):
         self.base_url = settings.news_api_url
         self.api_key = settings.news_api_key
+        self.cache_ttl = 1800  # 30 minutes for API responses
+    
+    def _generate_cache_key(self, query: str, language: str, sort_by: str, page_size: int, page: int) -> str:
+        """
+        Generate a cache key for API requests
+        """
+        params_str = f"{query}:{language}:{sort_by}:{page_size}:{page}"
+        return f"newsapi:{hashlib.md5(params_str.encode()).hexdigest()}"
     
     async def fetch_articles(
         self,
@@ -18,11 +29,20 @@ class NewsAPIService:
         language: str = "en",
         sort_by: str = "publishedAt",
         page_size: int = 20,
-        page: int = 1
+        page: int = 1,
+        use_cache: bool = True
     ) -> Dict[str, Any]:
         """
-        Fetch articles from NewsAPI
+        Fetch articles from NewsAPI with caching support
         """
+        # Check cache first if enabled
+        if use_cache:
+            cache_key = self._generate_cache_key(query, language, sort_by, page_size, page)
+            cached_response = cache_service.redis_client.get(cache_key)
+            if cached_response:
+                logger.info(f"Retrieved articles from cache for query: {query}")
+                return json.loads(cached_response)
+        
         params = {
             "q": query,
             "language": language,
@@ -36,7 +56,20 @@ class NewsAPIService:
             async with httpx.AsyncClient() as client:
                 response = await client.get(self.base_url, params=params)
                 response.raise_for_status()
-                return response.json()
+                api_response = response.json()
+                
+                # Cache the response if enabled
+                if use_cache:
+                    cache_key = self._generate_cache_key(query, language, sort_by, page_size, page)
+                    cache_service.redis_client.setex(
+                        cache_key, 
+                        self.cache_ttl, 
+                        json.dumps(api_response)
+                    )
+                    logger.info(f"Cached NewsAPI response for query: {query}")
+                
+                return api_response
+                
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
             raise Exception(f"Failed to fetch news: {e.response.status_code}")

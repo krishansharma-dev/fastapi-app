@@ -61,18 +61,13 @@ fastapi-app/
    - Alternative docs: http://localhost:8000/redoc
    - pgAdmin: http://localhost:5050 (admin@admin.com / admin)
 
-## API Endpoints
+## API Endpoints 
 
 ### General
 - `GET /` - Welcome message
 - `GET /health` - Health check
 
-### Users
-- `POST /api/v1/users/` - Create a new user
-- `GET /api/v1/users/` - Get all users
-- `GET /api/v1/users/{user_id}` - Get user by ID
-- `PUT /api/v1/users/{user_id}` - Update user
-- `DELETE /api/v1/users/{user_id}` - Delete user
+
 
 ### News Articles
 - `POST /api/v1/news/fetch` - Fetch articles from NewsAPI

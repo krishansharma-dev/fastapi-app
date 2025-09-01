@@ -4,33 +4,6 @@ from datetime import datetime
 from enum import Enum
 
 
-class UserBase(BaseModel):
-    email: EmailStr
-    username: str
-    full_name: Optional[str] = None
-    is_active: bool = True
-
-
-class UserCreate(UserBase):
-    pass
-
-
-class UserUpdate(BaseModel):
-    email: Optional[EmailStr] = None
-    username: Optional[str] = None
-    full_name: Optional[str] = None
-    is_active: Optional[bool] = None
-
-
-class User(UserBase):
-    id: int
-    created_at: datetime
-    updated_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
-
-
 # News Article Schemas
 class ArticleStatusEnum(str, Enum):
     PENDING = "pending"
